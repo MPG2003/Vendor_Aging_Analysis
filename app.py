@@ -287,7 +287,7 @@ def claude_proxy():
 
     openrouter_payload = {
         "model":      payload.get("model", "arcee-ai/trinity-large-preview:free"),
-        "max_tokens": payload.get("max_tokens", 1000),
+        "max_tokens": payload.get("max_tokens", 4096),
         "messages":   messages,
     }
 
@@ -314,6 +314,79 @@ def claude_proxy():
             }), 200
         else:
             err_msg = data.get("error", {}).get("message", str(data))
+            return jsonify({"error": err_msg}), resp.status_code
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gemini", methods=["POST"])
+def gemini_proxy():
+    """
+    Server-side proxy for Google Gemini API calls (fallback when OpenRouter hits limits).
+    Requires GEMINI_API_KEY environment variable to be set.
+    Accepts the same Anthropic-style payload as /api/claude and returns the same shape.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return jsonify({"error": "GEMINI_API_KEY not set on server"}), 500
+
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    # Build Gemini-style contents list
+    # System prompt is prepended as a user turn (Gemini flash supports systemInstruction too)
+    contents = []
+    system_prompt = payload.get("system", "")
+    for msg in payload.get("messages", []):
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+
+    gemini_payload = {
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": payload.get("max_tokens", 4096),
+            "temperature": 0.7,
+        },
+    }
+    if system_prompt:
+        gemini_payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+
+    # Use gemini-2.0-flash as the fallback model (free tier, generous limits)
+    model = "gemini-2.0-flash"
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
+
+    try:
+        resp = http_requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json=gemini_payload,
+            timeout=60,
+        )
+        data = resp.json()
+
+        if resp.status_code == 200 and "candidates" in data:
+            text = (
+                data["candidates"][0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+            )
+            # Return same Anthropic-style shape so the frontend needs no changes
+            return jsonify({
+                "content": [{"type": "text", "text": text}]
+            }), 200
+        else:
+            err_msg = (
+                data.get("error", {}).get("message", str(data))
+                if isinstance(data, dict)
+                else str(data)
+            )
             return jsonify({"error": err_msg}), resp.status_code
 
     except Exception as e:

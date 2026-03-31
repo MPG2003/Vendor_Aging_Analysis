@@ -168,7 +168,7 @@ Rules:
 - Currency in Indian format: use Cr for crores, L for lakhs, prefix with rupee symbol.
 - Be concise. State how many records match when listing vendors.`;
 
-  return await callAI([{ role: "user", content: query }], system, 1000);
+  return await callAI([{ role: "user", content: query }], system, 4096);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -211,7 +211,7 @@ Example output:
 
 Return ONLY the JSON array. No markdown. No explanation. No code fences.`;
 
-  const raw     = await callAI([{ role: "user", content: "Generate the 6 insights now." }], system, 900);
+  const raw     = await callAI([{ role: "user", content: "Generate the 6 insights now." }], system, 4096);
   const cleaned = raw.replace(/```json|```/gi, "").trim();
 
   let items;
@@ -269,7 +269,7 @@ window.sendChat = async function() {
   if (chatHistory.length > 18) chatHistory = chatHistory.slice(-14);
 
   try {
-    const raw   = await callAI(chatHistory, chatSystem(), 1200);
+    const raw   = await callAI(chatHistory, chatSystem(), 4096);
     const reply = renderMarkdown(raw);
     removeTyping();
     addBot(reply);
@@ -356,16 +356,35 @@ function wireKeys() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   FLASK PROXY CALL  →  /api/claude  →  OpenRouter
+   FLASK PROXY CALL
+   Primary  : /api/claude  →  OpenRouter  (arcee-ai/trinity-large-preview:free)
+   Fallback : /api/gemini  →  Google Gemini (gemini-2.0-flash)
+   On any rate-limit or server error from OpenRouter, the call is silently
+   retried against Gemini — the user sees no interruption.
    ═══════════════════════════════════════════════════════════════════════════ */
-async function callAI(messages, systemPrompt, maxTokens) {
-  maxTokens = maxTokens || 700;
 
-  const res = await fetch("/api/claude", {
+/* Returns true for HTTP status codes that indicate a rate-limit or overload
+   and that warrant a transparent retry on the fallback provider. */
+function _isRateLimitError(status, data) {
+  if (status === 429) return true;                       // Too Many Requests
+  if (status === 503) return true;                       // Service Unavailable
+  if (status === 529) return true;                       // OpenRouter overloaded
+  // Some providers embed "rate limit" / "quota" text in a 400/500
+  const errText = JSON.stringify(data || "").toLowerCase();
+  if (errText.includes("rate limit"))  return true;
+  if (errText.includes("quota"))       return true;
+  if (errText.includes("overloaded"))  return true;
+  if (errText.includes("limit exceeded")) return true;
+  return false;
+}
+
+/* Low-level call to a single endpoint; resolves with the text or throws. */
+async function _callEndpoint(endpoint, model, messages, systemPrompt, maxTokens) {
+  const res = await fetch(endpoint, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model:      "arcee-ai/trinity-large-preview:free",
+      model:      model,
       max_tokens: maxTokens,
       system:     systemPrompt,
       messages:   messages,
@@ -375,17 +394,56 @@ async function callAI(messages, systemPrompt, maxTokens) {
   const data = await res.json().catch(() => ({}));
 
   if (!res.ok) {
-    const msg = (data && data.error && (data.error.message || data.error)) || ("Server error " + res.status);
-    throw new Error(msg);
+    const msg = (data && data.error && (data.error.message || data.error)) ||
+                ("Server error " + res.status);
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data   = data;
+    throw err;
   }
 
   const text = (data.content || [])
     .filter(function(b) { return b.type === "text"; })
-    .map(function(b) { return b.text; })
+    .map(function(b)    { return b.text; })
     .join("");
 
-  if (!text) throw new Error("Empty response from AI. Please try again.");
+  if (!text) {
+    const err = new Error("Empty response from AI. Please try again.");
+    err.status = 200; // got a response but empty — don't retry
+    throw err;
+  }
+
   return text;
+}
+
+async function callAI(messages, systemPrompt, maxTokens) {
+  maxTokens = maxTokens || 4096;
+
+  /* ── 1. Try primary: OpenRouter / trinity-large-preview ── */
+  try {
+    return await _callEndpoint(
+      "/api/claude",
+      "arcee-ai/trinity-large-preview:free",
+      messages,
+      systemPrompt,
+      maxTokens
+    );
+  } catch (primaryErr) {
+    /* Only fall through to Gemini on rate-limit / server-side overload */
+    if (!_isRateLimitError(primaryErr.status, primaryErr.data)) {
+      throw primaryErr; // real error — surface it immediately
+    }
+    /* Silent fallback — no visible indication to the user */
+  }
+
+  /* ── 2. Fallback: Google Gemini ── */
+  return await _callEndpoint(
+    "/api/gemini",
+    "gemini-2.0-flash",
+    messages,
+    systemPrompt,
+    maxTokens
+  );
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

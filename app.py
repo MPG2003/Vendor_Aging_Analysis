@@ -301,7 +301,7 @@ def claude_proxy():
                 "X-Title":       "SAP Vendor Risk Monitor",
             },
             json=openrouter_payload,
-            timeout=60,
+            timeout=120,
         )
         data = resp.json()
 
@@ -366,7 +366,7 @@ def gemini_proxy():
             url,
             headers={"Content-Type": "application/json"},
             json=gemini_payload,
-            timeout=60,
+            timeout=120,
         )
         data = resp.json()
 

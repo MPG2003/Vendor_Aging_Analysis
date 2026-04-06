@@ -264,9 +264,8 @@ def intelligence():
 @app.route("/api/claude", methods=["POST"])
 def claude_proxy():
     """
-    Server-side proxy for OpenRouter API calls.
-    Avoids CORS issues when calling the API from the browser.
-    Requires OPENROUTER_API_KEY environment variable to be set.
+    OpenRouter only — arcee-ai/trinity-large-preview:free
+    Full prompt, no truncation. Returns Anthropic-style response.
     """
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
@@ -277,19 +276,15 @@ def claude_proxy():
     except Exception:
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    # Convert Anthropic-style payload to OpenRouter/OpenAI format
-    messages = []
     system_prompt = payload.get("system", "")
+    raw_messages  = payload.get("messages", [])
+    max_tokens    = min(int(payload.get("max_tokens", 2048)), 2048)
+
+    messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    for msg in payload.get("messages", []):
+    for msg in raw_messages:
         messages.append({"role": msg["role"], "content": msg["content"]})
-
-    openrouter_payload = {
-        "model":      payload.get("model", "arcee-ai/trinity-large-preview:free"),
-        "max_tokens": payload.get("max_tokens", 1000),
-        "messages":   messages,
-    }
 
     try:
         resp = http_requests.post(
@@ -297,26 +292,44 @@ def claude_proxy():
             headers={
                 "Content-Type":  "application/json",
                 "Authorization": f"Bearer {api_key}",
-                "HTTP-Referer":  "http://localhost:5000",
+                "HTTP-Referer":  "https://sap-vrm.app",
                 "X-Title":       "SAP Vendor Risk Monitor",
             },
-            json=openrouter_payload,
-            timeout=60,
+            json={
+                "model":      "arcee-ai/trinity-large-preview:free",
+                "max_tokens": max_tokens,
+                "messages":   messages,
+            },
+            timeout=120,
         )
-        data = resp.json()
+        print(f"[OpenRouter] status={resp.status_code}")
 
-        # Translate OpenAI-style response back to Anthropic-style
-        # so intelligence.js doesn't need to change
-        if resp.status_code == 200 and "choices" in data:
-            text = data["choices"][0]["message"]["content"]
-            return jsonify({
-                "content": [{"type": "text", "text": text}]
-            }), 200
-        else:
-            err_msg = data.get("error", {}).get("message", str(data))
-            return jsonify({"error": err_msg}), resp.status_code
+        try:
+            data = resp.json()
+        except Exception:
+            print(f"[OpenRouter] non-JSON response: {resp.text[:300]}")
+            return jsonify({"error": "Invalid response from OpenRouter"}), 500
 
+        if resp.status_code == 200:
+            choices = data.get("choices") or []
+            if choices:
+                text = choices[0].get("message", {}).get("content", "")
+                if text and text.strip():
+                    return jsonify({"content": [{"type": "text", "text": text}]}), 200
+            # Log unexpected shape
+            print(f"[OpenRouter] unexpected body: {str(data)[:300]}")
+            return jsonify({"error": "Empty or unexpected response from OpenRouter"}), 500
+
+        err = ""
+        if isinstance(data, dict):
+            err = data.get("error", {}).get("message", "") or str(data)
+        print(f"[OpenRouter] error {resp.status_code}: {err}")
+        return jsonify({"error": f"OpenRouter error ({resp.status_code}): {err}"}), resp.status_code
+
+    except http_requests.exceptions.Timeout:
+        return jsonify({"error": "Request timed out. The model is busy — please try again."}), 504
     except Exception as e:
+        print(f"[OpenRouter] exception: {e}")
         return jsonify({"error": str(e)}), 500
 
 

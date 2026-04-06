@@ -264,58 +264,101 @@ def intelligence():
 @app.route("/api/claude", methods=["POST"])
 def claude_proxy():
     """
-    Server-side proxy for OpenRouter API calls.
-    Avoids CORS issues when calling the API from the browser.
-    Requires OPENROUTER_API_KEY environment variable to be set.
+    AI proxy with two-provider fallback chain:
+      Primary  : Groq  — llama-3.3-70b-versatile  (fast, 2-3s, generous free tier)
+      Fallback : OpenRouter — arcee-ai/trinity-mini:free  (backup if Groq fails)
+    Returns Anthropic-style response shape so intelligence.js needs no changes.
     """
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        return jsonify({"error": "OPENROUTER_API_KEY not set on server"}), 500
+    groq_api_key        = os.environ.get("GROQ_API_KEY", "")
+    openrouter_api_key  = os.environ.get("OPENROUTER_API_KEY", "")
 
     try:
         payload = request.get_json(force=True)
     except Exception:
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    # Convert Anthropic-style payload to OpenRouter/OpenAI format
-    messages = []
     system_prompt = payload.get("system", "")
+    raw_messages  = payload.get("messages", [])
+    max_tokens    = min(int(payload.get("max_tokens", 2048)), 2048)
+
+    # Build OpenAI-style messages list (shared by both providers)
+    messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    for msg in payload.get("messages", []):
+    for msg in raw_messages:
         messages.append({"role": msg["role"], "content": msg["content"]})
 
-    openrouter_payload = {
-        "model":      payload.get("model", "arcee-ai/trinity-large-preview:free"),
-        "max_tokens": payload.get("max_tokens", 1000),
-        "messages":   messages,
-    }
+    # ------------------------------------------------------------------
+    # STEP 1: Groq — primary (fast, reliable free tier)
+    # ------------------------------------------------------------------
+    if groq_api_key:
+        try:
+            resp = http_requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {groq_api_key}",
+                },
+                json={
+                    "model":      "llama-3.3-70b-versatile",
+                    "max_tokens": max_tokens,
+                    "messages":   messages,
+                },
+                timeout=30,
+            )
+            print(f"[Groq] status={resp.status_code}")
+            data = resp.json()
+
+            if resp.status_code == 200 and "choices" in data and data["choices"]:
+                text = data["choices"][0]["message"]["content"]
+                if text and text.strip():
+                    return jsonify({"content": [{"type": "text", "text": text}]}), 200
+
+            err = data.get("error", {}).get("message", str(data)) if isinstance(data, dict) else str(data)
+            print(f"[Groq] failed: {err} — trying OpenRouter fallback")
+
+        except http_requests.exceptions.Timeout:
+            print("[Groq] timed out — trying OpenRouter fallback")
+        except Exception as e:
+            print(f"[Groq] exception: {e} — trying OpenRouter fallback")
+    else:
+        print("[Groq] GROQ_API_KEY not set — skipping to OpenRouter")
+
+    # ------------------------------------------------------------------
+    # STEP 2: OpenRouter — fallback (Trinity Mini, free)
+    # ------------------------------------------------------------------
+    if not openrouter_api_key:
+        return jsonify({"error": "No AI provider available. Set GROQ_API_KEY or OPENROUTER_API_KEY."}), 500
 
     try:
         resp = http_requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Content-Type":  "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "HTTP-Referer":  "http://localhost:5000",
+                "Authorization": f"Bearer {openrouter_api_key}",
+                "HTTP-Referer":  "https://sap-vrm.app",
                 "X-Title":       "SAP Vendor Risk Monitor",
             },
-            json=openrouter_payload,
-            timeout=60,
+            json={
+                "model":      "arcee-ai/trinity-mini:free",
+                "max_tokens": max_tokens,
+                "messages":   messages,
+            },
+            timeout=90,
         )
+        print(f"[OpenRouter fallback] status={resp.status_code}")
         data = resp.json()
 
-        # Translate OpenAI-style response back to Anthropic-style
-        # so intelligence.js doesn't need to change
-        if resp.status_code == 200 and "choices" in data:
+        if resp.status_code == 200 and "choices" in data and data["choices"]:
             text = data["choices"][0]["message"]["content"]
-            return jsonify({
-                "content": [{"type": "text", "text": text}]
-            }), 200
-        else:
-            err_msg = data.get("error", {}).get("message", str(data))
-            return jsonify({"error": err_msg}), resp.status_code
+            if text and text.strip():
+                return jsonify({"content": [{"type": "text", "text": text}]}), 200
 
+        err = data.get("error", {}).get("message", str(data)) if isinstance(data, dict) else str(data)
+        return jsonify({"error": f"OpenRouter fallback failed: {err}"}), 500
+
+    except http_requests.exceptions.Timeout:
+        return jsonify({"error": "Both providers timed out. Please try again."}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

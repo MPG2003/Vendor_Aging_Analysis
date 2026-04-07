@@ -17,8 +17,30 @@ from ml_model import run_vendor_risk_analysis
 import numpy as np
  
 app = Flask(__name__)
-
 app.secret_key = "sap_vrm_secret_2024"
+
+# ── Gzip compression — shrinks 4.4MB pages to ~400KB (~90% reduction) ────────
+import gzip as _gzip
+
+@app.after_request
+def compress_response(response):
+    if (response.status_code < 200 or response.status_code >= 300
+            or response.direct_passthrough):
+        return response
+    accept_encoding = request.headers.get("Accept-Encoding", "")
+    if "gzip" not in accept_encoding.lower():
+        return response
+    content = response.get_data()
+    if len(content) < 1024:
+        return response
+    compressed = _gzip.compress(content, compresslevel=6)
+    if len(compressed) >= len(content):
+        return response
+    response.set_data(compressed)
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"]   = len(compressed)
+    response.vary.add("Accept-Encoding")
+    return response
  
 os.makedirs("uploads", exist_ok=True)
 
@@ -260,12 +282,30 @@ def intelligence():
 
     return render_template("intelligence.html", data=json.dumps(data))
 
+
+@app.route("/api/data")
+def api_data():
+    """Serve result JSON via API — allows pages to fetch data async instead of embedding it."""
+    result_id = session.get("result_id")
+    if not result_id:
+        return jsonify({"error": "no_session"}), 401
+    result_file = os.path.join(RESULTS_FOLDER, f"{result_id}.json")
+    if not os.path.exists(result_file):
+        return jsonify({"error": "expired"}), 404
+    with open(result_file) as f:
+        data = json.load(f)
+    resp = jsonify(data)
+    resp.headers["Cache-Control"] = "private, max-age=300"
+    return resp
+
  
 @app.route("/api/claude", methods=["POST"])
 def claude_proxy():
     """
-    OpenRouter only — arcee-ai/trinity-large-preview:free
-    Full prompt, no truncation. Returns Anthropic-style response.
+    OpenRouter proxy — full prompt, no truncation.
+    Primary  : arcee-ai/trinity-large-preview:free  (128K context)
+    Fallback : qwen/qwen3.6-plus-preview:free        (1M context, built-in reasoning)
+    Returns Anthropic-style response so intelligence.js needs no changes.
     """
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
@@ -286,51 +326,68 @@ def claude_proxy():
     for msg in raw_messages:
         messages.append({"role": msg["role"], "content": msg["content"]})
 
-    try:
-        resp = http_requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Content-Type":  "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "HTTP-Referer":  "https://sap-vrm.app",
-                "X-Title":       "SAP Vendor Risk Monitor",
-            },
-            json={
-                "model":      "arcee-ai/trinity-large-preview:free",
-                "max_tokens": max_tokens,
-                "messages":   messages,
-            },
-            timeout=120,
-        )
-        print(f"[OpenRouter] status={resp.status_code}")
+    MODELS = [
+        "arcee-ai/trinity-large-preview:free",  # primary  — 128K context
+        "qwen/qwen3.6-plus-preview:free",        # fallback — 1M context, built-in reasoning
+    ]
 
+    def _call(model):
         try:
-            data = resp.json()
-        except Exception:
-            print(f"[OpenRouter] non-JSON response: {resp.text[:300]}")
-            return jsonify({"error": "Invalid response from OpenRouter"}), 500
+            resp = http_requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "HTTP-Referer":  "https://sap-vrm.app",
+                    "X-Title":       "SAP Vendor Risk Monitor",
+                },
+                json={
+                    "model":      model,
+                    "max_tokens": max_tokens,
+                    "messages":   messages,
+                },
+                timeout=120,
+            )
+            print(f"[OpenRouter] model={model} status={resp.status_code}")
 
-        if resp.status_code == 200:
-            choices = data.get("choices") or []
-            if choices:
-                text = choices[0].get("message", {}).get("content", "")
-                if text and text.strip():
-                    return jsonify({"content": [{"type": "text", "text": text}]}), 200
-            # Log unexpected shape
-            print(f"[OpenRouter] unexpected body: {str(data)[:300]}")
-            return jsonify({"error": "Empty or unexpected response from OpenRouter"}), 500
+            try:
+                data = resp.json()
+            except Exception:
+                return None, f"Non-JSON response (HTTP {resp.status_code})"
 
-        err = ""
-        if isinstance(data, dict):
-            err = data.get("error", {}).get("message", "") or str(data)
-        print(f"[OpenRouter] error {resp.status_code}: {err}")
-        return jsonify({"error": f"OpenRouter error ({resp.status_code}): {err}"}), resp.status_code
+            if resp.status_code == 200:
+                choices = data.get("choices") or []
+                if choices:
+                    text = choices[0].get("message", {}).get("content", "")
+                    if text and text.strip():
+                        return text, None
+                return None, f"Empty response: {str(data)[:200]}"
 
-    except http_requests.exceptions.Timeout:
-        return jsonify({"error": "Request timed out. The model is busy — please try again."}), 504
-    except Exception as e:
-        print(f"[OpenRouter] exception: {e}")
-        return jsonify({"error": str(e)}), 500
+            err = data.get("error", {}).get("message", str(data)) if isinstance(data, dict) else str(data)
+            return None, f"HTTP {resp.status_code}: {err}"
+
+        except http_requests.exceptions.Timeout:
+            return None, "Timed out after 120s"
+        except Exception as e:
+            return None, str(e)
+
+    last_err = ""
+    for model in MODELS:
+        text, err = _call(model)
+        if text:
+            return jsonify({"content": [{"type": "text", "text": text}]}), 200
+        print(f"[OpenRouter] {model} failed: {err} — trying next")
+        last_err = err
+
+    return jsonify({"error": f"All models failed. Last error: {last_err}"}), 500
+
+
+# ── Static file caching — tells browser to cache JS/CSS for 7 days ───────────
+@app.after_request
+def add_cache_headers(response):
+    if request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "public, max-age=604800, immutable"
+    return response
 
 
 if __name__ == "__main__":

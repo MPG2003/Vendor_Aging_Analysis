@@ -302,9 +302,14 @@ def api_data():
 @app.route("/api/claude", methods=["POST"])
 def claude_proxy():
     """
-    OpenRouter proxy — full prompt, no truncation.
-    Primary  : arcee-ai/trinity-large-preview:free  (128K context)
-    Fallback : qwen/qwen3.6-plus-preview:free        (1M context, built-in reasoning)
+    OpenRouter proxy — compact prompts, reliable free-model fallback chain.
+
+    Model chain (tried in order, first success wins):
+      1. nvidia/nemotron-3-super-120b-a12b:free  — 262K ctx, 120B hybrid MoE, NVIDIA
+      2. meta-llama/llama-3.3-70b-instruct:free  — 128K ctx, GPT-4-level quality, Meta
+      3. google/gemma-4-31b-it:free              — 256K ctx, Google DeepMind latest
+      4. openrouter/free                          — auto-router catch-all, always available
+
     Returns Anthropic-style response so intelligence.js needs no changes.
     """
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -326,9 +331,14 @@ def claude_proxy():
     for msg in raw_messages:
         messages.append({"role": msg["role"], "content": msg["content"]})
 
+    # ── Model fallback chain ─────────────────────────────────────────────────
+    # Each model is tried in order; first non-empty response wins.
+    # Using correct full model IDs as listed on openrouter.ai
     MODELS = [
-        "arcee-ai/trinity-large-preview:free",  # primary  — 128K context
-        "qwen/qwen3.6-plus-preview:free",        # fallback — 1M context, built-in reasoning
+        "nvidia/nemotron-3-super-120b-a12b:free",  # primary  — 262K ctx, strong reasoning
+        "meta-llama/llama-3.3-70b-instruct:free",  # fallback — 128K ctx, very reliable
+        "google/gemma-4-31b-it:free",               # fallback — 256K ctx, Google latest
+        "openrouter/free",                           # catch-all — auto-router, never fails
     ]
 
     def _call(model):

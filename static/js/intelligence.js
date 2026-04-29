@@ -1,10 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════════
    SAP VRM — AI Intelligence  (intelligence.js)
-   Three features:
-     1. Natural Language Query Engine
-     2. AI Insight Generator
-     3. Vendor Risk Chatbot
-   All LLM calls go through Flask /api/claude proxy → OpenRouter.
+   Feature: Vendor Risk Chatbot only.
+   LLM calls go through Flask /api/claude proxy → OpenRouter.
    ═══════════════════════════════════════════════════════════════════════════ */
 "use strict";
 
@@ -19,8 +16,54 @@ const TOP10         = RAW_DATA.top10     || [];
 let chatHistory = [];
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   REASONING SCRUBBER
+   Strips chain-of-thought / thinking blocks that some models leak.
+   Patterns covered:
+     <think>…</think>   (Deepseek, some Nemotron builds)
+     <reasoning>…</reasoning>
+     Bare lines that look like internal monologue before the real answer
+   ═══════════════════════════════════════════════════════════════════════════ */
+function scrubReasoning(text) {
+  if (!text) return "";
+
+  // Remove <think>…</think> blocks (may span multiple lines)
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  // Remove <reasoning>…</reasoning> blocks
+  text = text.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, "");
+  // Remove <reflection>…</reflection> blocks
+  text = text.replace(/<reflection>[\s\S]*?<\/reflection>/gi, "");
+
+  // Some models prefix with a "Scan list:" / "Let's extract…" monologue
+  // before the actual structured answer. Detect and strip lines that look
+  // like internal reasoning (heuristic: paragraph of plain sentences before
+  // the first markdown heading or bullet list).
+  const lines = text.split("\n");
+  let answerStart = 0;
+  let foundStructure = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    // Real answer starts at first heading, bullet, numbered item, or bold header
+    if (/^#{1,3}\s+/.test(t) || /^[-•*]\s+/.test(t) || /^\d+[.)]\s+/.test(t) || /^\*\*/.test(t)) {
+      answerStart  = i;
+      foundStructure = true;
+      break;
+    }
+  }
+
+  // Only strip prefix monologue if the model produced structured content after it
+  // AND the prefix is suspiciously long (> 4 lines of plain text)
+  if (foundStructure && answerStart > 4) {
+    text = lines.slice(answerStart).join("\n");
+  }
+
+  return text.trim();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    MARKDOWN → HTML RENDERER
-   Converts AI markdown responses into clean, styled HTML bubbles.
+   Handles: headings, bold, italic, code, ordered/unordered lists,
+            pipe-delimited tables (| col | col |), and plain paragraphs.
    ═══════════════════════════════════════════════════════════════════════════ */
 function renderMarkdown(text) {
   if (!text) return "";
@@ -28,38 +71,85 @@ function renderMarkdown(text) {
   // If the text already looks like HTML (starts with a tag), return as-is
   if (/^\s*<[a-z]/i.test(text)) return text;
 
-  const lines = text.split("\n");
-  let html = "";
-  let inOL = false;
-  let inUL = false;
+  // First scrub any reasoning bleed-through
+  text = scrubReasoning(text);
 
+  const lines = text.split("\n");
+  let html   = "";
+  let inOL   = false;
+  let inUL   = false;
+  let inTBL  = false;
+  let tblRows = [];
+
+  /* ── close any open list or table ─────────────────────────────────────── */
   const closeList = () => {
     if (inOL) { html += "</ol>"; inOL = false; }
     if (inUL) { html += "</ul>"; inUL = false; }
   };
 
+  const flushTable = () => {
+    if (!inTBL || tblRows.length === 0) { inTBL = false; tblRows = []; return; }
+    // First row = header, second row = separator (skip), rest = body
+    let thtml = `<div style="overflow-x:auto;margin:8px 0">
+<table style="width:100%;border-collapse:collapse;font-size:12px">`;
+
+    tblRows.forEach((row, idx) => {
+      // Skip pure separator rows (---|---| pattern)
+      if (/^[\s|:\-]+$/.test(row)) return;
+
+      const cells = row.split("|").map(c => c.trim()).filter((_, i, a) => i > 0 && i < a.length - 1 || a.length > 1);
+      // Remove empty first/last caused by leading/trailing pipe
+      const clean = row.replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+
+      if (idx === 0) {
+        // Header row
+        thtml += "<thead><tr>"
+          + clean.map(c => `<th style="padding:5px 8px;border-bottom:1px solid rgba(255,255,255,.15);text-align:left;color:var(--accent-light);white-space:nowrap">${inlineFormat(c)}</th>`).join("")
+          + "</tr></thead><tbody>";
+      } else {
+        thtml += "<tr>"
+          + clean.map((c, ci) => `<td style="padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.07);${ci === 0 ? "color:var(--accent-light);white-space:nowrap" : ""}">${inlineFormat(c)}</td>`).join("")
+          + "</tr>";
+      }
+    });
+
+    thtml += "</tbody></table></div>";
+    html  += thtml;
+    inTBL  = false;
+    tblRows = [];
+  };
+
   const inlineFormat = (s) => s
-    // **bold**
     .replace(/\*\*(.*?)\*\*/g, '<strong style="color:var(--accent-light)">$1</strong>')
-    // *italic*
-    .replace(/\*(.*?)\*/g, '<em>$1</em>')
-    // `code`
-    .replace(/`([^`]+)`/g, '<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:4px;font-size:12px">$1</code>')
-    // currency shorthand
+    .replace(/\*(.*?)\*/g,     '<em>$1</em>')
+    .replace(/`([^`]+)`/g,     '<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:4px;font-size:12px">$1</code>')
     .replace(/Rs\./g, "₹");
+
+  /* ── detect pipe-table row ─────────────────────────────────────────────── */
+  const isPipeRow = (l) => /^\|.+\|/.test(l.trim()) || (l.trim().split("|").length > 2);
 
   for (let i = 0; i < lines.length; i++) {
     const raw  = lines[i];
     const line = raw.trim();
 
-    // Empty line → paragraph break
+    /* ── pipe table ──────────────────────────────────────────────────────── */
+    if (isPipeRow(line)) {
+      closeList();
+      if (!inTBL) inTBL = true;
+      tblRows.push(line);
+      continue;
+    } else if (inTBL) {
+      flushTable();
+    }
+
+    /* ── empty line ──────────────────────────────────────────────────────── */
     if (!line) {
       closeList();
       html += "<br>";
       continue;
     }
 
-    // ### Heading
+    /* ── headings ─────────────────────────────────────────────────────────── */
     if (/^#{1,3}\s+/.test(line)) {
       closeList();
       const content = inlineFormat(line.replace(/^#{1,3}\s+/, ""));
@@ -67,7 +157,7 @@ function renderMarkdown(text) {
       continue;
     }
 
-    // **Bold line acting as a header** (entire line is bold)
+    /* ── bold-only line acting as heading ─────────────────────────────────── */
     if (/^\*\*[^*]+\*\*:?\s*$/.test(line)) {
       closeList();
       const content = inlineFormat(line);
@@ -75,40 +165,35 @@ function renderMarkdown(text) {
       continue;
     }
 
-    // Numbered list: "1. item" or "1) item"
+    /* ── numbered list ────────────────────────────────────────────────────── */
     if (/^\d+[.)]\s+/.test(line)) {
       if (inUL) { html += "</ul>"; inUL = false; }
-      if (!inOL) {
-        html += `<ol style="margin:6px 0;padding-left:20px;display:flex;flex-direction:column;gap:3px">`;
-        inOL = true;
-      }
+      if (!inOL) { html += `<ol style="margin:6px 0;padding-left:20px;display:flex;flex-direction:column;gap:3px">`; inOL = true; }
       const content = inlineFormat(line.replace(/^\d+[.)]\s+/, ""));
       html += `<li style="font-size:13px;line-height:1.55">${content}</li>`;
       continue;
     }
 
-    // Unordered list: "- item" or "• item" or "* item"
+    /* ── unordered list ───────────────────────────────────────────────────── */
     if (/^[-•*]\s+/.test(line)) {
       if (inOL) { html += "</ol>"; inOL = false; }
-      if (!inUL) {
-        html += `<ul style="margin:6px 0;padding-left:18px;display:flex;flex-direction:column;gap:3px">`;
-        inUL = true;
-      }
+      if (!inUL) { html += `<ul style="margin:6px 0;padding-left:18px;display:flex;flex-direction:column;gap:3px">`; inUL = true; }
       const content = inlineFormat(line.replace(/^[-•*]\s+/, ""));
       html += `<li style="font-size:13px;line-height:1.55">${content}</li>`;
       continue;
     }
 
-    // Regular paragraph line
+    /* ── regular paragraph ────────────────────────────────────────────────── */
     closeList();
     html += `<span style="display:block;margin-bottom:2px">${inlineFormat(line)}</span>`;
   }
 
+  /* close anything still open */
   closeList();
+  flushTable();
 
-  // Clean up multiple consecutive <br> tags
+  /* clean up excess <br> */
   html = html.replace(/(<br>\s*){3,}/g, "<br><br>");
-  // Remove leading/trailing <br>
   html = html.replace(/^(<br>)+|(<br>)+$/g, "");
 
   return html;
@@ -123,117 +208,7 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   1. NATURAL LANGUAGE QUERY ENGINE
-   ═══════════════════════════════════════════════════════════════════════════ */
-window.quickQuery = function(el) {
-  document.getElementById("nlInput").value = el.textContent.trim();
-  runNLQuery();
-};
-
-window.runNLQuery = async function() {
-  const query = document.getElementById("nlInput").value.trim();
-  const btn   = document.getElementById("nlBtn");
-  const panel = document.getElementById("nlResult");
-
-  if (!query) return;
-
-  btn.disabled = true;
-  btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Querying...`;
-  panel.className = "nl-result";
-  panel.innerHTML = "";
-
-  try {
-    const html = await nlQuery(query);
-    panel.innerHTML = html;
-    panel.className = "nl-result show";
-  } catch (e) {
-    panel.innerHTML = `<div class="err-msg"><i class="fas fa-exclamation-triangle"></i> ${e.message}</div>`;
-    panel.className = "nl-result show";
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = `<i class="fas fa-bolt"></i> Query`;
-  }
-};
-
-async function nlQuery(query) {
-  const system = `You are a data analyst for an SAP Vendor Risk Monitoring system.
-Answer the user's question using ONLY the vendor data below.
-
-${buildSnapshot(50)}
-
-Rules:
-- Respond in clean HTML only — no markdown, no code fences.
-- Start with: <div class="nl-result-label">RESULT</div>
-- For lists of vendors use: <table class="nl-result-table"><thead>...</thead><tbody>...</tbody></table>
-- Currency in Indian format: use Cr for crores, L for lakhs, prefix with rupee symbol.
-- Be concise. State how many records match when listing vendors.`;
-
-  return await callAI([{ role: "user", content: query }], system, 1000);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   2. AI INSIGHT GENERATOR
-   ═══════════════════════════════════════════════════════════════════════════ */
-window.generateInsights = async function() {
-  const btn   = document.getElementById("insightBtn");
-  const body  = document.getElementById("insightsBody");
-  const empty = document.getElementById("insightsEmpty");
-
-  btn.disabled = true;
-  btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Analysing...`;
-  if (empty) empty.style.display = "none";
-
-  body.innerHTML = Array(6).fill(`<div class="shimmer"></div>`).join("");
-
-  try {
-    body.innerHTML = await buildInsights();
-  } catch (e) {
-    body.innerHTML = `<div class="err-msg"><i class="fas fa-exclamation-triangle"></i> ${e.message}</div>`;
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = `<i class="fas fa-sync-alt"></i> Regenerate`;
-  }
-};
-
-async function buildInsights() {
-  const system = `You are a senior finance risk analyst writing a CFO briefing.
-Analyse the vendor risk data below and return EXACTLY 6 insight objects as a JSON array.
-
-${buildSnapshot(30)}
-
-Each object must have exactly these keys:
-  "icon"  - one of: fire, exclamation-triangle, chart-line, coins, calendar-alt, users, shield-alt, map-marker-alt
-  "color" - one of: red, orange, amber, blue, green, purple
-  "text"  - 1 to 2 sentences; wrap key numbers or names in HTML strong tags
-
-Example output:
-[{"icon":"fire","color":"red","text":"<strong>8%</strong> of vendors account for <strong>52%</strong> of total overdue."}]
-
-Return ONLY the JSON array. No markdown. No explanation. No code fences.`;
-
-  const raw     = await callAI([{ role: "user", content: "Generate the 6 insights now." }], system, 900);
-  const cleaned = raw.replace(/```json|```/gi, "").trim();
-
-  let items;
-  try {
-    items = JSON.parse(cleaned);
-  } catch (_) {
-    const match = cleaned.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error("Could not parse AI response. Please try again.");
-    items = JSON.parse(match[0]);
-  }
-
-  return items.map((item, i) => `
-    <div class="insight-item" style="animation-delay:${i * 0.07}s">
-      <div class="insight-icon ${item.color || "blue"}">
-        <i class="fas fa-${item.icon || "lightbulb"}"></i>
-      </div>
-      <div class="insight-text">${item.text}</div>
-    </div>`).join("");
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   3. VENDOR RISK CHATBOT
+   VENDOR RISK CHATBOT
    ═══════════════════════════════════════════════════════════════════════════ */
 function bootChat() {
   const critical = VENDORS.filter(v => v.predicted_risk === "Critical").length;
@@ -269,12 +244,13 @@ window.sendChat = async function() {
   if (chatHistory.length > 18) chatHistory = chatHistory.slice(-14);
 
   try {
-    const raw   = await callAI(chatHistory, chatSystem(), 1200);
-    const reply = renderMarkdown(raw);
+    const raw     = await callAI(chatHistory, chatSystem(), 1200);
+    const cleaned = scrubReasoning(raw);
+    const reply   = renderMarkdown(cleaned);
     removeTyping();
     addBot(reply);
-    chatHistory.push({ role: "assistant", content: raw });
-    const sugs = followups(text, raw);
+    chatHistory.push({ role: "assistant", content: cleaned });
+    const sugs = followups(text, cleaned);
     if (sugs.length) showSugs(sugs);
   } catch (e) {
     removeTyping();
@@ -291,11 +267,13 @@ ${buildSnapshot(25)}
 
 Rules:
 - Reply using plain text with markdown formatting ONLY: **bold**, bullet lists with "- item", numbered lists with "1. item".
-- Do NOT use HTML tags in your response.
+- For tabular data use a pipe-delimited markdown table: | Col | Col | with a separator row | --- | --- |
+- Do NOT output any thinking, reasoning, or internal monologue. Only output the final answer.
+- Do NOT wrap your answer in <think>, <reasoning>, or any XML tags.
 - CRITICAL: Always complete your response fully. Never stop mid-sentence or mid-list. If listing vendors, finish the entire list.
 - If a list would be very long, limit yourself to the top 5 items and say "(showing top 5)" — but always end with a complete sentence.
-- Keep replies under 200 words unless a detailed list is needed; detailed lists may go up to 350 words.
-- Use short sections with a bold heading then bullets below it.
+- Keep replies under 250 words unless a detailed table is needed; detailed tables may go up to 400 words.
+- Use short sections with a bold heading then bullets or table below it.
 - Currency in Indian rupee format (Cr, L).
 - Always give a short actionable recommendation at the end.`;
 }
@@ -350,9 +328,6 @@ function wireKeys() {
   document.getElementById("chatInp").addEventListener("keydown", e => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
   });
-  document.getElementById("nlInput").addEventListener("keydown", e => {
-    if (e.key === "Enter") { e.preventDefault(); runNLQuery(); }
-  });
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -365,7 +340,7 @@ async function callAI(messages, systemPrompt, maxTokens) {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model:      "arcee-ai/trinity-large-preview:free",
+      model:      "nvidia/nemotron-3-super:free",
       max_tokens: maxTokens,
       system:     systemPrompt,
       messages:   messages,
@@ -389,18 +364,10 @@ async function callAI(messages, systemPrompt, maxTokens) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   DATA SNAPSHOT  – uses ai_context when available for richer, more accurate
-   AI responses; falls back to the legacy KPI/vendor table otherwise.
+   DATA SNAPSHOT
    ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Top-level ai_context alias (populated by Flask if ml_model >= v2) */
 const AI_CTX = RAW_DATA.ai_context || null;
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   COMPUTED AGGREGATES — single source of truth, mirrors dashboard.js exactly
-   All numbers are derived from the same VENDORS array the dashboard uses,
-   so the chatbot and charts are guaranteed to match.
-   ═══════════════════════════════════════════════════════════════════════════ */
 const _AGG = (function() {
   var totalOverdue = 0, highRisk = 0, critical = 0;
   var riskOverdue  = { Critical: 0, High: 0, Medium: 0, Low: 0 };
@@ -417,72 +384,58 @@ const _AGG = (function() {
     }
   });
 
-  // Top 10 by overdue amount — same sort as dashboard Top-10 chart
   var top10ByOverdue = VENDORS.slice()
     .sort(function(a, b) { return b.overdue_amount - a.overdue_amount; })
     .slice(0, 10);
 
-  // Top 10 by risk score — same sort as dashboard preview table
   var top10ByScore = VENDORS.slice()
     .sort(function(a, b) { return b.risk_score - a.risk_score; })
     .slice(0, 10);
 
-  // Aging buckets — use backend invoice-level data (same source as chart)
   var aging = RAW_DATA.aging_buckets || {};
 
   return {
-    totalVendors : VENDORS.length,
-    totalOverdue : totalOverdue,
-    highRisk     : highRisk,
-    critical     : critical,
-    riskOverdue  : riskOverdue,
-    riskCount    : riskCount,
+    totalVendors  : VENDORS.length,
+    totalOverdue  : totalOverdue,
+    highRisk      : highRisk,
+    critical      : critical,
+    riskOverdue   : riskOverdue,
+    riskCount     : riskCount,
     top10ByOverdue: top10ByOverdue,
     top10ByScore  : top10ByScore,
     aging         : aging,
   };
 })();
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   buildSnapshot() — feeds every AI call with a full, consistent data view.
-   The "maxVendors" param is kept for backwards compat but the full vendor
-   list is always sent in a compact pipe-delimited format.
-   ═══════════════════════════════════════════════════════════════════════════ */
 function buildSnapshot(maxVendors) {
-
-  /* ── KPIs (computed from VENDORS, same as dashboard) ────────────────────── */
   const kpiBlock =
-    "=== KPIs (matches dashboard exactly) ===\n"
+    "=== KPIs ===\n"
     + "Total vendors          : " + _AGG.totalVendors + "\n"
     + "Total overdue exposure : " + fmt(_AGG.totalOverdue) + "\n"
     + "High risk vendors      : " + _AGG.highRisk + "\n"
     + "Critical vendors       : " + _AGG.critical + "\n";
 
-  /* ── Aging buckets (invoice-level from backend, same as aging chart) ──────── */
   const BUCKET_KEYS = ["0-30", "31-60", "61-90", "91-120", "120+"];
   const agingBlock =
-    "=== Invoice Aging Buckets (per-invoice amounts — matches Aging chart) ===\n"
+    "=== Invoice Aging Buckets ===\n"
     + BUCKET_KEYS.map(function(k) {
         return "  " + k + " days: " + fmt(_AGG.aging[k] || 0);
       }).join("\n");
 
-  /* ── Risk distribution (vendor counts — matches pie chart) ──────────────── */
   const distBlock =
-    "=== Risk Distribution (vendor count — matches Risk Pie chart) ===\n"
+    "=== Risk Distribution (vendor count) ===\n"
     + ["Critical","High","Medium","Low"].map(function(r) {
         return "  " + r + ": " + (_AGG.riskCount[r] || 0) + " vendors";
       }).join("\n");
 
-  /* ── Per-risk overdue totals (computed from VENDORS) ────────────────────── */
   const riskOverdueBlock =
     "\n=== Overdue Exposure by Risk Level ===\n"
     + ["Critical","High","Medium","Low"].map(function(r) {
         return "  " + r + ": " + fmt(_AGG.riskOverdue[r] || 0);
       }).join("\n");
 
-  /* ── Top 10 by overdue amount (matches Top-10 bar chart) ────────────────── */
   const top10OverdueBlock =
-    "\n=== Top 10 Vendors by Overdue Amount (matches dashboard chart) ===\n"
+    "\n=== Top 10 Vendors by Overdue Amount ===\n"
     + _AGG.top10ByOverdue.map(function(v, i) {
         return "  " + (i+1) + ". " + v.vendor_name + " (" + v.vendor_id + ")"
           + " | Overdue:" + fmt(v.overdue_amount)
@@ -490,9 +443,8 @@ function buildSnapshot(maxVendors) {
           + " | " + v.predicted_risk;
       }).join("\n");
 
-  /* ── Top 10 by risk score (matches dashboard preview table) ─────────────── */
   const top10ScoreBlock =
-    "\n=== Top 10 Vendors by Risk Score (matches dashboard table) ===\n"
+    "\n=== Top 10 Vendors by Risk Score ===\n"
     + _AGG.top10ByScore.map(function(v, i) {
         return "  " + (i+1) + ". " + v.vendor_name + " (" + v.vendor_id + ")"
           + " | Score:" + Number(v.risk_score).toFixed(1)
@@ -501,7 +453,6 @@ function buildSnapshot(maxVendors) {
           + " | MaxDays:" + Math.round(v.max_days_overdue || 0);
       }).join("\n");
 
-  /* ── Country & payment term breakdowns (from ai_context) ────────────────── */
   let countryBlock = "";
   if (AI_CTX && AI_CTX.country_distribution && Object.keys(AI_CTX.country_distribution).length) {
     countryBlock = "\n=== Overdue by Country (top 10) ===\n"
@@ -524,7 +475,6 @@ function buildSnapshot(maxVendors) {
           .join("\n");
   }
 
-  /* ── Most overdue individual invoices (from ai_context) ─────────────────── */
   let invoiceBlock = "";
   if (AI_CTX && AI_CTX.top50_most_overdue_invoices && AI_CTX.top50_most_overdue_invoices.length) {
     invoiceBlock = "\n=== Top 20 Most Overdue Individual Invoices ===\n"
@@ -537,8 +487,6 @@ function buildSnapshot(maxVendors) {
         }).join("\n");
   }
 
-  /* ── Full vendor table — ALL vendors, compact format ────────────────────── */
-  // Check if country/payment-term fields are present
   const sampleV  = VENDORS[0] || {};
   const hasExtra = !!(sampleV.country || sampleV.LAND1);
   const totalVend = VENDORS.length;
@@ -584,7 +532,8 @@ function buildSnapshot(maxVendors) {
     + tableHeader
     + rows;
 }
-/* ── formatters ─────────────────────────────────────────────────────────── */
+
+/* ── formatters ──────────────────────────────────────────────────────────── */
 function fmt(n) {
   n = Number(n) || 0;
   if (n >= 1e9) return "\u20B9" + (n / 1e9).toFixed(2) + "B";
